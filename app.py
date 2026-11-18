@@ -50,6 +50,16 @@ def base_index():
     return engine.build_index()
 
 
+# 안전장치: 서버가 예전 engine을 기억하고 있거나 data가 일부만 올라가도, 앱이 직접 가상 데이터를 다시 만든다
+if not os.path.exists(INBOX_FILE):
+    import json
+    import make_data
+    make_data.main()
+    with open(os.path.join(engine.DATA, "file_meta.json"), encoding="utf-8") as _f:
+        engine.FILE_META.update(json.load(_f))
+    base_index.clear()
+
+
 def new_workspace():
     return engine.Workspace(docs=list(base_index()))
 
