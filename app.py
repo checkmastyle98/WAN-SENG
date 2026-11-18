@@ -1,4 +1,4 @@
-"""복기 — 인수인계 없는 신입을 위한 업무 맥락 복원 AI 에이전트 (해커톤 시연판)
+"""완생 — 인수인계 없는 신입을 위한 업무 맥락 복원 AI 에이전트 (해커톤 시연판)
 
 실행: streamlit run app.py
 API 설정: .streamlit/secrets.toml (README 참고)
@@ -10,7 +10,7 @@ import streamlit as st
 
 import engine
 
-st.set_page_config(page_title="복기 | 업무 맥락 복원 AI", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="완생 | 업무 맥락 복원 AI", page_icon="🧭", layout="wide")
 
 MAX_QUESTIONS = 25  # 세션당 질문 수 제한 (API 비용 보호)
 INBOX_FILE = os.path.join(engine.DATA, "inbox", "2026-11_오더PO정리.xlsx")
@@ -80,7 +80,7 @@ def ask(question):
         return
     chat_fn = engine.openai_chat_fn(get_client(api_key, get_secret("BASE_URL")), get_secret("MODEL", "gpt-4o-mini"))
     ss.chat.append({"role": "user", "content": question})
-    with st.spinner("복기가 파일 서버를 찾아보는 중입니다..."):
+    with st.spinner("완생이 파일 서버를 찾아보는 중입니다..."):
         try:
             answer, trace, ss.history = engine.run_agent(ss.ws, ss.history, question, chat_fn)
         except Exception as e:
@@ -102,7 +102,7 @@ TOOL_LABEL = {"search_files": "🔍 검색", "read_file": "📄 파일 열기",
 def show_trace(trace):
     if not trace:
         return
-    with st.expander(f"복기가 찾아본 과정 보기 ({len(trace)}단계)"):
+    with st.expander(f"완생이 찾아본 과정 보기 ({len(trace)}단계)"):
         for i, t in enumerate(trace, 1):
             arg = next(iter(t["args"].values()), "") if t["args"] else ""
             st.markdown(f"**{i}. {TOOL_LABEL.get(t['tool'], t['tool'])}** `{arg}`")
@@ -124,7 +124,7 @@ ss = st.session_state
 with st.sidebar:
     st.subheader("심사위원 체험 가이드 (3분)")
     st.markdown(
-        "1. **쪽지 받기** 탭에서 첨부파일을 복기에 넣습니다.\n"
+        "1. **쪽지 받기** 탭에서 첨부파일을 완생에 넣습니다.\n"
         "2. **쪽지 내용으로 물어보기**를 누릅니다.\n"
         "3. 답변의 **근거 있음 / 추정 / 알 수 없음** 표시와 출처 경로를 확인합니다.\n"
         "4. 추천 질문 중 **입고율 90%** 질문을 눌러 봅니다.\n"
@@ -142,7 +142,7 @@ with st.sidebar:
     st.caption("모든 회사·사람·파일은 시연용 가상 데이터입니다. 실제 개인정보나 회사 자료는 쓰지 않았습니다.")
     st.caption("AI 연결은 OpenAI 호환 방식이라, 본선에서는 접속 주소만 바꿔 사내 로컬 AI로 전환할 수 있습니다.")
 
-st.title("🧭 복기")
+st.title("🧭 완생")
 st.markdown("**인수인계 없는 신입을 위한 업무 맥락 복원 AI 에이전트** · 전임자의 파일·회의록·메일을 엮어 \"왜 이렇게 되어 있는지\"를 근거와 함께 알려줍니다.")
 
 tab_chat, tab_confirm, tab_fs = st.tabs(["① 쪽지 받기 · 질문하기", "② 확인 요청함", "③ 회사 파일 서버 보기"])
@@ -156,7 +156,7 @@ with tab_chat:
             with open(INBOX_FILE, "rb") as f:
                 st.download_button(f"📎 {NOTE['file']} 내려받기", f.read(), file_name=NOTE["file"])
     with col_act:
-        st.markdown("**첨부파일을 복기에 넣기**")
+        st.markdown("**첨부파일을 완생에 넣기**")
         if st.button("📎 쪽지 첨부파일 바로 넣기", type="primary"):
             ss.ws.add_upload(NOTE["file"], INBOX_FILE)
         up = st.file_uploader("또는 엑셀 파일 직접 올리기", type=["xlsx"])
@@ -185,7 +185,7 @@ with tab_chat:
             if cols[i % 2].button(q, key=f"fu{i}"):
                 ss.pending = q
 
-    typed = st.chat_input("복기에게 물어보기 (예: 단가는 왜 직접 입력하면 안 돼?)")
+    typed = st.chat_input("완생에게 물어보기 (예: 단가는 왜 직접 입력하면 안 돼?)")
     if typed:
         ss.pending = typed
     if ss.pending:

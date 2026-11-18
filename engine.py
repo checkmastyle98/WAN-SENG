@@ -1,4 +1,4 @@
-"""복기 에이전트의 두뇌: 파일 서버 색인, AI가 쓰는 도구, 도구 호출 루프.
+"""완생 에이전트의 두뇌: 파일 서버 색인, AI가 쓰는 도구, 도구 호출 루프.
 
 Streamlit 없이도 돌아가게 분리해 두었다. (테스트·로컬 AI 교체가 쉬움)
 """
@@ -17,7 +17,10 @@ CONFIRM_DIR = SERVER + r"\생산부\조성파트\확인답변"
 UPLOAD_PREFIX = "업로드/"
 
 # data 폴더가 GitHub에 안 올라갔어도 동작하도록, 없으면 가상 데이터를 그 자리에서 만든다
-if not os.path.exists(os.path.join(DATA, "file_meta.json")):
+_REQUIRED = [os.path.join(DATA, "file_meta.json"),
+             os.path.join(DATA, "inbox", "2026-11_오더PO정리.xlsx"),
+             os.path.join(FS_ROOT, "생산부", "조성파트", "구매", "PO정리")]
+if not all(os.path.exists(p) for p in _REQUIRED):  # 일부만 올라간 경우도 통째로 다시 만든다
     import make_data
     make_data.main()
 
@@ -118,7 +121,7 @@ class Workspace:
         item["status"] = "답변 완료"
         item["answer"] = answer
         text = (f"[담당자 확인 답변]\n질문: {item['question']}\n답변자: {who}\n답변: {answer}\n"
-                f"(복기 에이전트의 확인 요청으로 기록됨)")
+                f"(완생 에이전트의 확인 요청으로 기록됨)")
         slug = re.sub(r"[^0-9A-Za-z가-힣]+", "_", item["question"])[:30]
         d = Doc(CONFIRM_DIR + f"\\2026-11-18_{slug}.txt", f"{slug}.txt", "2026-11-18", "문서", text)
         self.docs.append(d)
@@ -226,7 +229,7 @@ TOOLS = [
 FUNCS = {"search_files": search_files, "read_file": read_file,
          "list_folder": list_folder, "request_confirmation": request_confirmation}
 
-SYSTEM_PROMPT = """당신은 '복기'입니다. 제조회사 가온페이퍼(가상)의 사내 AI 에이전트로, 인수인계 없이 업무를 받은 신입사원이 전임자의 업무 맥락을 되짚도록 돕습니다.
+SYSTEM_PROMPT = """당신은 '완생'입니다. 제조회사 가온페이퍼(가상)의 사내 AI 에이전트로, 인수인계 없이 업무를 받은 신입사원이 전임자의 업무 맥락을 되짚도록 돕습니다.
 오늘은 2026-11-18입니다. 회사 파일 서버 주소는 \\\\gaon-fs01 입니다.
 
 [일하는 방식]
