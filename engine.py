@@ -19,7 +19,9 @@ UPLOAD_PREFIX = "업로드/"
 # data 폴더가 GitHub에 안 올라갔어도 동작하도록, 없으면 가상 데이터를 그 자리에서 만든다
 _REQUIRED = [os.path.join(DATA, "file_meta.json"),
              os.path.join(DATA, "inbox", "2026-11_오더PO정리.xlsx"),
-             os.path.join(FS_ROOT, "생산부", "조성파트", "구매", "PO정리")]
+             os.path.join(FS_ROOT, "생산부", "조성파트", "구매", "PO정리"),
+             # v2 데이터(업무 흐름 메일)가 없으면 예전 data 폴더이므로 새로 만든다
+             os.path.join(FS_ROOT, "생산부", "조성파트", "메일보관", "2026-10-06_생산계획팀_PO정리_활용안내.txt")]
 if not all(os.path.exists(p) for p in _REQUIRED):  # 일부만 올라간 경우도 통째로 다시 만든다
     import make_data
     make_data.main()
@@ -102,20 +104,91 @@ def build_index():
 
 
 # ------------------------------------------------------------------ 세션 상태
+MEETING_DIR = SERVER + r"\생산부\조성파트\회의록"
+
+
 @dataclass
 class Workspace:
     """심사위원 한 명의 세션. 다른 사람의 확인 답변과 섞이지 않게 세션마다 따로 둔다."""
     docs: list
     uploads: dict = field(default_factory=dict)        # 이름 -> Doc
-    confirmations: list = field(default_factory=list)  # {"id","question","reason","status","answer"}
+    upload_paths: dict = field(default_factory=dict)   # 이름 -> 세션 전용 엑셀 사본 경로
+    confirmations: list = field(default_factory=list)  # {"id","question","reason","status","answer","kind"}
+    updates: list = field(default_factory=list)        # 회의록 → 개정이력 반영 기록 (신입에게 보여줄 '업무 업데이트')
 
     def all_docs(self):
         return self.docs + list(self.uploads.values())
 
+    def ensure_copy(self, name, abs_path):
+        """원본을 건드리지 않도록 세션 전용 사본을 만든다. (개정이력 반영도 이 사본에만 한다)"""
+        import shutil
+        import tempfile
+        if name not in self.upload_paths:
+            tmpdir = tempfile.mkdtemp(prefix="wanseng_")
+            copy_path = os.path.join(tmpdir, name)
+            shutil.copy(abs_path, copy_path)
+            self.upload_paths[name] = copy_path
+        return self.upload_paths[name]
+
     def add_upload(self, name, abs_path):
-        d = load_doc(abs_path, UPLOAD_PREFIX + name, "방금 받음")
+        self.ensure_copy(name, abs_path)
+        d = load_doc(self.upload_paths[name], UPLOAD_PREFIX + name, "방금 받음")
         self.uploads[name] = d
         return d
+
+    def revision_rows(self, name):
+        """업로드한 엑셀의 개정이력 시트를 [{개정번호,...}] 로 돌려준다."""
+        p = self.upload_paths.get(name)
+        if not p:
+            return []
+        wb = load_workbook(p)
+        if "개정이력" not in wb.sheetnames:
+            return []
+        rows = [r for r in wb["개정이력"].iter_rows(values_only=True) if any(v is not None for v in r)]
+        if not rows:
+            return []
+        head = [str(h) for h in rows[0]]
+        return [dict(zip(head, r)) for r in rows[1:]]
+
+    def apply_meeting(self, name, title, meeting_date, minutes, decisions, approver):
+        """선임이 승인한 회의 결정을 ①회의록 파일로 저장하고 ②업로드 엑셀 개정이력에 Rev를 추가하고
+        ③신입에게 보여줄 업무 업데이트로 남긴다. decisions: [{"change","reason"}]"""
+        slug = re.sub(r"[^0-9A-Za-z가-힣]+", "_", title).strip("_")[:30]
+        mdoc = Doc(MEETING_DIR + f"\\{meeting_date}_{slug}_AI정리.txt", f"{meeting_date}_{slug}_AI정리.txt",
+                   meeting_date, "문서", minutes.strip())
+        self.docs = [d for d in self.docs if d.vpath != mdoc.vpath] + [mdoc]
+        added = []
+        p = self.upload_paths.get(name)
+        if p:
+            wb = load_workbook(p)
+            log = wb["개정이력"] if "개정이력" in wb.sheetnames else wb.create_sheet("개정이력")
+            if log.max_row < 1 or log.cell(1, 1).value is None:
+                log.append(["개정번호", "개정일", "작성자", "개정 내용", "근거 자료"])
+            nums = [int(m.group(1)) for r in log.iter_rows(min_row=2, values_only=True)
+                    for m in [re.match(r"Rev\.(\d+)", str(r[0] or ""))] if m]
+            n = max(nums or [0])
+            for dcs in decisions:
+                n += 1
+                row = [f"Rev.{n}", meeting_date, f"{approver} 승인",
+                       dcs["change"].strip(), f"{meeting_date} {title} (이유: {dcs.get('reason', '').strip() or '회의록 참조'})"]
+                log.append(row)
+                added.append(dict(zip(["개정번호", "개정일", "작성자", "개정 내용", "근거 자료"], row)))
+            wb.save(p)
+            if name in self.uploads:  # 신입이 이미 넣은 파일이면 최신 개정이력으로 다시 읽는다
+                self.uploads[name] = load_doc(p, UPLOAD_PREFIX + name, "방금 받음")
+        self.updates.append({"date": meeting_date, "title": title, "approver": approver,
+                             "revisions": added, "minutes_path": mdoc.vpath})
+        return added, mdoc
+
+    def add_review_request(self, item, question, why):
+        """위험도가 높은 항목을 선임 검토 요청으로 보낸다. (근거가 있어도 확인받는 항목)"""
+        for c in self.confirmations:
+            if c["question"] == question:
+                return c
+        c = {"id": len(self.confirmations) + 1, "question": question, "reason": why,
+             "status": "답변 대기", "answer": "", "kind": f"검토 · {item}"}
+        self.confirmations.append(c)
+        return c
 
     def add_confirmation_answer(self, item, answer, who):
         item["status"] = "답변 완료"
@@ -199,7 +272,7 @@ def request_confirmation(ws, question, reason):
         if c["question"] == question:
             return {"상태": "이미 요청됨", "요청번호": c["id"]}
     item = {"id": len(ws.confirmations) + 1, "question": question, "reason": reason,
-            "status": "답변 대기", "answer": ""}
+            "status": "답변 대기", "answer": "", "kind": "근거 없음 · 확인"}
     ws.confirmations.append(item)
     return {"상태": "담당자 확인 요청 등록", "요청번호": item["id"]}
 
@@ -229,49 +302,100 @@ TOOLS = [
 FUNCS = {"search_files": search_files, "read_file": read_file,
          "list_folder": list_folder, "request_confirmation": request_confirmation}
 
-SYSTEM_PROMPT = """당신은 '완생'입니다. 제조회사 가온페이퍼(가상)의 사내 AI 에이전트로, 인수인계 없이 업무를 받은 신입사원이 전임자의 업무 맥락을 되짚도록 돕습니다.
+_LEVEL = {"type": "string", "enum": ["근거 있음", "추정", "알 수 없음"]}
+_STEP = {"type": "object", "properties": {
+    "who": {"type": "string", "description": "부서·사람 (예: 구매팀 박지현 과장)"},
+    "what": {"type": "string", "description": "그 단계에서 하는 일 한 줄"},
+    "source": {"type": "string", "description": "근거 파일 경로. 없으면 빈 문자열"},
+    "level": _LEVEL}, "required": ["who", "what", "level"]}
+
+SUBMIT_TOOL = {"type": "function", "function": {
+    "name": "submit_onboarding_report",
+    "description": "조사가 끝나면 마지막에 딱 한 번 호출해 신입에게 보여줄 업무 안내서를 제출한다. 모든 내용은 도구로 확인한 것만 쓴다.",
+    "parameters": {"type": "object", "properties": {
+        "file_summary": {"type": "string", "description": "받은 파일이 무엇인지 1~2문장"},
+        "flow": {"type": "object", "description": "이 일의 전후 사정: 앞 단계 → 나 → 뒤 단계", "properties": {
+            "before": {"type": "array", "items": _STEP, "description": "이 일이 시작되기 전 단계(누가 무엇을 넘겨주나)"},
+            "me": {"type": "object", "properties": {
+                "what": {"type": "string"}, "due": {"type": "string"}}, "required": ["what"]},
+            "after": {"type": "array", "items": _STEP, "description": "결과물을 받는 곳과 그 쓰임새"},
+            "purpose": {"type": "string", "description": "그래서 이 일을 왜 하는지 한 문장"}},
+            "required": ["before", "me", "after", "purpose"]},
+        "risks": {"type": "array", "description": "틀리면 어떻게 되나: 항목별 영향", "items": {"type": "object", "properties": {
+            "item": {"type": "string", "description": "칸·시트·작업 이름 (예: 입고수량)"},
+            "impact": {"type": "string", "description": "틀리면 어디서 무슨 문제가 생기나"},
+            "risk": {"type": "string", "enum": ["높음", "보통", "낮음"]},
+            "source": {"type": "string"}, "level": _LEVEL},
+            "required": ["item", "impact", "risk", "level"]}},
+        "reasons": {"type": "array", "description": "왜 이렇게 되어 있나: 개정마다 하나", "items": {"type": "object", "properties": {
+            "rev": {"type": "string"}, "change": {"type": "string"}, "why": {"type": "string"},
+            "source": {"type": "string"}, "level": _LEVEL}, "required": ["rev", "change", "why", "level"]}},
+        "todos": {"type": "array", "description": "무엇을 하면 되나: 순서대로", "items": {"type": "object", "properties": {
+            "task": {"type": "string"}, "due": {"type": "string"}, "source": {"type": "string"}}, "required": ["task"]}},
+        "reviews": {"type": "array", "description": "무엇을 확인받아야 하나: 위험도 '높음' 항목과 근거가 없는 '왜'", "items": {"type": "object", "properties": {
+            "item": {"type": "string"}, "question": {"type": "string", "description": "선임에게 보낼 질문 한 문장"},
+            "why": {"type": "string", "description": "왜 확인받아야 하는지"}}, "required": ["item", "question", "why"]}},
+        "previous_files": {"type": "array", "items": {"type": "string"}, "description": "전임자의 이전 파일 경로"},
+    }, "required": ["file_summary", "flow", "risks", "reasons", "todos", "reviews"]}}}
+
+SYSTEM_PROMPT = """당신은 '완생'입니다. 제조회사 가온페이퍼(가상)의 사내 AI 에이전트로, 인수인계 없이 업무를 받은 신입사원이
+'이 일을 왜 하는지'를 알고 일하도록 돕습니다. AI가 일을 대신하지 않고, 신입이 빠르게 파악하고 중요한 부분은 선임에게 검토받게 합니다.
 오늘은 2026-11-18입니다. 회사 파일 서버 주소는 \\\\gaon-fs01 입니다.
 
 [일하는 방식]
 1. 답하기 전에 반드시 도구로 확인한다. 업로드 파일이 있으면 먼저 read_file로 읽고, search_files로 관련 파일·회의록·메일·표준서를 찾고, 중요한 파일은 read_file로 직접 연다.
 2. 경로·날짜·사람·수치는 도구 결과에 나온 것만 쓴다. 지어내지 않는다.
 3. '왜 이렇게 되어 있는지'는 개정이력의 '근거 자료' 칸, 회의록의 [결정], 메일, 표준서에서 찾는다.
-4. 모든 주장 앞에 근거 수준을 붙인다.
-   - [근거 있음] 파일에 직접 적혀 있음 → 문장 끝에 (출처: 파일 경로)
+4. 모든 주장에 근거 수준을 붙인다.
+   - [근거 있음] 파일에 직접 적혀 있음 → (출처: 파일 경로)
    - [추정] 직접 기록은 없지만 여러 자료로 미루어 짐작함 → 무엇을 보고 짐작했는지 밝힘
-   - [알 수 없음] 찾아봤지만 기록이 없음 → request_confirmation 도구로 담당자 확인 요청을 등록하고 그 사실을 알림
-   - [추정]인데 업무 판단에 영향이 크면 역시 request_confirmation으로 확인 요청을 등록한다
+   - [알 수 없음] 찾아봤지만 기록이 없음 → request_confirmation 도구로 담당자 확인 요청을 등록한다
    - 이전에 등록된 '확인답변' 파일이 있으면 그것을 근거로 [근거 있음]으로 답한다
 5. 같은 달 파일이 여러 개면(예: 최종, 최종_수정) 메모·메일로 어느 것이 최종본인지 확인한다.
+6. 위험도: 틀리면 정산·발주·원가·품질에 영향을 주는 칸은 '높음'이다. '높음' 항목은 근거가 있어도 선임 검토 대상(reviews)에 넣는다.
 
-[신입이 처음 파일을 받았을 때 답변 형식]
-### 1. 이 파일은 무엇인가요
-### 2. 전임자의 이전 파일은 어디에 있나요 (경로 목록)
-### 3. 개정 이력과 그 이유 (개정마다 근거 수준 표시)
-### 4. 이번에 할 일 (기한 포함 체크리스트)
+후속 질문에는 짧게 답하고, 문장마다 [근거 있음]/[추정]/[알 수 없음]을 붙인다. 한국어로, 신입이 바로 따라 할 수 있게 쓴다."""
 
-후속 질문에는 위 형식 없이 짧게 답한다. 한국어로, 신입이 바로 따라 할 수 있게 구체적으로 쓴다."""
+ONBOARD_RULE = """
+[이번 질문은 '처음 업무를 받은 상황'이다]
+조사 순서: ①업로드 파일 읽기 ②표준서·메일에서 이 일의 앞 단계(누가 넘겨주나)와 뒤 단계(누가 받아 무엇에 쓰나) 찾기
+③개정이력의 근거 자료(회의록·메일) 열기 ④전임자 개인 폴더·메모 확인.
+조사가 끝나면 일반 답변 대신 submit_onboarding_report 도구를 꼭 한 번 호출해 결과를 제출한다.
+flow.after에는 결과물을 받는 모든 곳을 넣고, risks는 3~6개, reviews에는 위험도 '높음' 항목과 근거가 없는 질문을 넣는다."""
 
 
-# ------------------------------------------------------------------ 에이전트 루프
-def run_agent(ws, history, user_msg, chat_fn, max_steps=8):
+def run_agent(ws, history, user_msg, chat_fn, max_steps=10, onboarding=False):
     """chat_fn(messages, tools) -> {"content": str|None, "tool_calls": [{"id","name","arguments"}]}
-    반환: (최종 답변, 도구 호출 기록, 갱신된 history)"""
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": user_msg}]
+    반환: (최종 답변 글, 도구 호출 기록, 갱신된 history, 업무 안내서 dict 또는 None)"""
+    system = SYSTEM_PROMPT + (ONBOARD_RULE if onboarding else "")
+    tools = TOOLS + ([SUBMIT_TOOL] if onboarding else [])
+    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": user_msg}]
     trace = []
-    for _ in range(max_steps):
-        msg = chat_fn(messages, TOOLS)
+    for step in range(max_steps):
+        msg = chat_fn(messages, tools)
         calls = msg.get("tool_calls") or []
         if not calls:
             answer = msg.get("content") or "(답변을 만들지 못했습니다)"
             new_history = history + [{"role": "user", "content": user_msg},
                                      {"role": "assistant", "content": answer}]
-            return answer, trace, new_history
+            return answer, trace, new_history, None
         # Gemini 3 계열은 도구 호출에 붙은 서명(thought signature)을 다시 돌려줘야 하므로, 받은 그대로(raw) 되돌려 보낸다
         messages.append({"role": "assistant", "content": msg.get("content") or "",
                          "tool_calls": [c.get("raw") or {"id": c["id"], "type": "function",
                                          "function": {"name": c["name"], "arguments": c["arguments"]}} for c in calls]})
         for c in calls:
+            if c["name"] == "submit_onboarding_report":
+                try:
+                    report = json.loads(c["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    report = None
+                if report:
+                    summary = report_to_text(report)
+                    new_history = history + [{"role": "user", "content": user_msg},
+                                             {"role": "assistant", "content": summary}]
+                    return summary, trace, new_history, report
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": "형식 오류: JSON으로 다시 제출하세요."})
+                continue
             try:
                 args = json.loads(c["arguments"] or "{}")
                 result = FUNCS[c["name"]](ws, **args)
@@ -280,7 +404,51 @@ def run_agent(ws, history, user_msg, chat_fn, max_steps=8):
             trace.append({"tool": c["name"], "args": args, "result": result})
             messages.append({"role": "tool", "tool_call_id": c["id"],
                              "content": json.dumps(result, ensure_ascii=False)})
-    return "도구 호출이 너무 길어져 멈췄습니다. 질문을 조금 더 좁혀 주세요.", trace, history
+        if onboarding and step == max_steps - 2:
+            messages.append({"role": "user", "content": "이제 조사를 멈추고 submit_onboarding_report로 지금까지 확인한 내용을 제출하세요."})
+    return "도구 호출이 너무 길어져 멈췄습니다. 질문을 조금 더 좁혀 주세요.", trace, history, None
+
+
+def report_to_text(r):
+    """대화 기록(후속 질문의 맥락)용으로 업무 안내서를 짧은 글로 바꾼다."""
+    f = r.get("flow", {})
+    lines = [f"[업무 안내서] {r.get('file_summary', '')}",
+             "흐름: " + " / ".join(f"{s.get('who')}: {s.get('what')}" for s in f.get("before", []))
+             + f" → 나: {f.get('me', {}).get('what', '')} → "
+             + " / ".join(f"{s.get('who')}: {s.get('what')}" for s in f.get("after", [])),
+             "목적: " + f.get("purpose", "")]
+    lines += [f"위험 {x.get('item')}({x.get('risk')}): {x.get('impact')}" for x in r.get("risks", [])]
+    lines += [f"{x.get('rev')} {x.get('change')} - 이유: {x.get('why')} [{x.get('level')}]" for x in r.get("reasons", [])]
+    lines += [f"할 일: {x.get('task')} ({x.get('due', '')})" for x in r.get("todos", [])]
+    lines += [f"검토: {x.get('item')} - {x.get('question')}" for x in r.get("reviews", [])]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ 회의록 → 결정 사항 추출
+def extract_decisions_rule(minutes):
+    """AI 없이도 동작하는 기본 추출: '[결정]'으로 시작하는 줄을 뽑는다."""
+    out = []
+    for ln in minutes.splitlines():
+        m = re.search(r"\[결정\]\s*(.+)", ln)
+        if m:
+            out.append({"change": m.group(1).strip(), "reason": ""})
+    return out
+
+
+def extract_decisions_ai(minutes, client, model):
+    """회의록에서 업무 양식·기준을 바꾸는 결정과 그 이유를 뽑는다. 실패하면 규칙 기반으로 돌아간다."""
+    prompt = ("다음은 AI로 정리한 회의록이다. 월간 '오더PO정리' 업무의 양식·기준·절차를 바꾸는 결정만 골라라. "
+              "각 결정마다 change(무엇이 바뀌는지 한 문장)와 reason(회의록에 적힌 이유, 없으면 빈 문자열)을 쓴다. "
+              "회의록에 없는 내용은 지어내지 않는다. JSON 객체 {\"decisions\": [...]} 로만 답한다.\n\n" + minutes)
+    try:
+        r = client.chat.completions.create(model=model, temperature=0,
+                                           response_format={"type": "json_object"},
+                                           messages=[{"role": "user", "content": prompt}])
+        data = json.loads(r.choices[0].message.content or "{}")
+        dec = [d for d in data.get("decisions", []) if d.get("change")]
+        return dec or extract_decisions_rule(minutes), "AI"
+    except Exception:
+        return extract_decisions_rule(minutes), "규칙"
 
 
 def openai_chat_fn(client, model):
