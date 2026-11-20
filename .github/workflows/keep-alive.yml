@@ -1,0 +1,22 @@
+name: 완생 앱 깨우기
+
+on:
+  schedule:
+    - cron: "17 */4 * * *"   # 4시간마다 (UTC 기준, 매시 17분)
+  workflow_dispatch:          # Actions 탭에서 직접 실행 버튼
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Playwright 설치
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: 앱 방문
+        run: python keepalive.py
